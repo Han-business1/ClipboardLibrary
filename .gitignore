@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local runtime data and logs
+*.db
+*.db-journal
+*.log
+_installer_test*/
+
+# Generated packaging output
+build*/
+dist*/
+release/
+*.spec
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
