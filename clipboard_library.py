@@ -39,6 +39,7 @@ DEFAULT_SETTINGS = {
     "window_x": None,
     "window_y": None,
     "window_maximized": False,
+    "sidebar_width": 230,
     "list_width": 455,
 }
 
@@ -446,6 +447,7 @@ class ClipboardLibrary(tk.Tk):
         self.tray_commands: queue.SimpleQueue[str] = queue.SimpleQueue()
         self.really_quitting = False
         self.layout_save_after: str | None = None
+        self.layout_normalize_after: str | None = None
         self.layout_ready = False
 
         self.title(self.t("app"))
@@ -509,16 +511,32 @@ class ClipboardLibrary(tk.Tk):
     def _build(self) -> None:
         shell = tk.Frame(self, bg=self.PANEL, highlightbackground=self.BORDER, highlightthickness=1)
         shell.pack(fill="both", expand=True, padx=18, pady=18)
+        self.shell = shell
+        initial_sidebar_width = 230
+        shell.grid_rowconfigure(0, weight=1)
+        shell.grid_columnconfigure(0, minsize=initial_sidebar_width)
+        shell.grid_columnconfigure(1, minsize=7)
+        shell.grid_columnconfigure(2, weight=1, minsize=630)
 
-        sidebar = tk.Frame(shell, bg=self.SIDEBAR, width=190)
-        sidebar.pack(side="left", fill="y")
-        sidebar.pack_propagate(False)
+        sidebar = tk.Frame(shell, bg=self.SIDEBAR, width=initial_sidebar_width)
+        self.sidebar_panel = sidebar
+        sidebar.grid(row=0, column=0, sticky="nsew")
+        sidebar.grid_propagate(False)
+        self.sidebar_handle = tk.Frame(shell, bg=self.BORDER, width=7,
+                                       cursor="sb_h_double_arrow")
+        self.sidebar_handle.grid(row=0, column=1, sticky="ns")
+        self.sidebar_handle.bind("<ButtonPress-1>", self.on_sidebar_press)
+        self.sidebar_handle.bind("<B1-Motion>", self.on_sidebar_motion)
+        self.sidebar_handle.bind("<ButtonRelease-1>", self.on_sidebar_release)
         brand = tk.Frame(sidebar, bg=self.SIDEBAR)
-        brand.pack(fill="x", padx=18, pady=(22, 28))
+        brand.pack(fill="x", padx=14, pady=(22, 28))
+        brand.grid_columnconfigure(1, weight=1)
         tk.Label(brand, text="▣", bg=self.SIDEBAR, fg=self.ACCENT,
-                 font=("Segoe UI Symbol", 24, "bold")).pack(side="left")
-        tk.Label(brand, text="Clipboard\nLibrary", bg=self.SIDEBAR, fg=self.TEXT,
-                 justify="left", font=("Segoe UI", 11, "bold")).pack(side="left", padx=8)
+                 font=("Segoe UI Symbol", 24, "bold")).grid(row=0, column=0, sticky="w")
+        self.brand_label = tk.Label(brand, text="Clipboard\nLibrary", bg=self.SIDEBAR,
+                                    fg=self.TEXT, justify="left", anchor="w",
+                                    font=("Segoe UI", 10, "bold"))
+        self.brand_label.grid(row=0, column=1, sticky="w", padx=(10, 0))
 
         self.nav_buttons: dict[str, tk.Button] = {}
         nav_items = (("history", "◷", "history"), ("pinned", "★", "pinned"),
@@ -537,11 +555,13 @@ class ClipboardLibrary(tk.Tk):
         self.side_count_label = tk.Label(side_bottom, text=f"0 {self.t('items')}", bg=self.SIDEBAR,
                                          fg=self.MUTED, font=("Segoe UI", 9))
         self.side_count_label.pack(anchor="w")
-        tk.Label(side_bottom, text=self.t("local_only"), bg=self.SIDEBAR, fg=self.MUTED,
-                 wraplength=150, justify="left", font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(5, 0))
+        self.local_only_label = tk.Label(side_bottom, text=self.t("local_only"), bg=self.SIDEBAR,
+                                         fg=self.MUTED, wraplength=190, justify="left",
+                                         font=("Microsoft YaHei UI", 8))
+        self.local_only_label.pack(anchor="w", pady=(5, 0))
 
         workspace = tk.Frame(shell, bg=self.PANEL)
-        workspace.pack(side="left", fill="both", expand=True)
+        workspace.grid(row=0, column=2, sticky="nsew")
         topbar = tk.Frame(workspace, bg=self.PANEL)
         topbar.pack(fill="x", padx=22, pady=(18, 12))
         titles = tk.Frame(topbar, bg=self.PANEL)
@@ -561,11 +581,11 @@ class ClipboardLibrary(tk.Tk):
         content_area = tk.Frame(workspace, bg=self.PANEL)
         content_area.pack(fill="both", expand=True, padx=22, pady=(0, 18))
         self.content_area = content_area
-        initial_list_width = 455
+        initial_list_width = 280
         content_area.grid_rowconfigure(0, weight=1)
         content_area.grid_columnconfigure(0, minsize=initial_list_width)
         content_area.grid_columnconfigure(1, minsize=7)
-        content_area.grid_columnconfigure(2, weight=1, minsize=340)
+        content_area.grid_columnconfigure(2, weight=1, minsize=300)
         left = tk.Frame(content_area, bg=self.PANEL, width=initial_list_width)
         right = tk.Frame(content_area, bg=self.PANEL)
         self.list_panel = left
@@ -825,6 +845,10 @@ class ClipboardLibrary(tk.Tk):
 
     def restore_layout(self) -> None:
         self.update_idletasks()
+        if hasattr(self, "shell"):
+            desired_sidebar = int(self.settings.get("sidebar_width", 230))
+            self.settings["sidebar_width"] = self.apply_sidebar_width(desired_sidebar)
+            self.update_idletasks()
         if hasattr(self, "content_area"):
             desired = int(self.settings.get("list_width", 455))
             self.settings["list_width"] = self.apply_list_width(desired)
@@ -839,6 +863,12 @@ class ClipboardLibrary(tk.Tk):
     def on_window_configure(self, event: tk.Event) -> None:
         if event.widget is self and self.layout_ready and not self.really_quitting:
             self.schedule_layout_save()
+            if self.layout_normalize_after:
+                try:
+                    self.after_cancel(self.layout_normalize_after)
+                except tk.TclError:
+                    pass
+            self.layout_normalize_after = self.after(140, self.normalize_panel_widths)
 
     def schedule_layout_save(self) -> None:
         if not self.layout_ready or self.really_quitting:
@@ -850,9 +880,72 @@ class ClipboardLibrary(tk.Tk):
                 pass
         self.layout_save_after = self.after(500, self.save_window_layout)
 
+    def normalize_panel_widths(self) -> None:
+        self.layout_normalize_after = None
+        if self.really_quitting:
+            return
+        if hasattr(self, "sidebar_panel"):
+            self.settings["sidebar_width"] = self.apply_sidebar_width(
+                int(self.settings.get("sidebar_width", 230))
+            )
+            self.update_idletasks()
+        if hasattr(self, "list_panel"):
+            self.settings["list_width"] = self.apply_list_width(
+                int(self.settings.get("list_width", 455))
+            )
+
+    def clamp_sidebar_width(self, width: int) -> int:
+        available = max(864, self.shell.winfo_width())
+        brand_minimum = 210
+        if hasattr(self, "brand_label"):
+            brand_minimum = max(brand_minimum, self.brand_label.master.winfo_reqwidth() + 28)
+        maximum = min(380, max(brand_minimum, available - 637))
+        return max(brand_minimum, min(int(width), maximum))
+
+    def apply_sidebar_width(self, width: int) -> int:
+        desired = self.clamp_sidebar_width(width)
+        self.sidebar_panel.configure(width=desired)
+        self.shell.grid_columnconfigure(0, minsize=desired)
+        if hasattr(self, "local_only_label"):
+            self.local_only_label.configure(wraplength=max(150, desired - 40))
+        return desired
+
+    def on_sidebar_press(self, event: tk.Event) -> None:
+        self.sidebar_drag_origin = event.x_root
+        self.sidebar_drag_start = self.sidebar_panel.winfo_width()
+        self.sidebar_drag_target = self.sidebar_drag_start
+        self.sidebar_handle.configure(bg=self.ACCENT)
+        try:
+            self.sidebar_handle.grab_set()
+        except tk.TclError:
+            pass
+
+    def on_sidebar_motion(self, event: tk.Event) -> None:
+        if not hasattr(self, "sidebar_drag_origin"):
+            return
+        self.sidebar_drag_target = self.clamp_sidebar_width(
+            self.sidebar_drag_start + event.x_root - self.sidebar_drag_origin
+        )
+
+    def on_sidebar_release(self, event: tk.Event) -> None:
+        self.on_sidebar_motion(event)
+        try:
+            self.sidebar_handle.grab_release()
+        except tk.TclError:
+            pass
+        self.sidebar_handle.configure(bg=self.BORDER)
+        target = getattr(self, "sidebar_drag_target", self.sidebar_panel.winfo_width())
+        self.settings["sidebar_width"] = self.apply_sidebar_width(target)
+        self.update_idletasks()
+        self.settings["list_width"] = self.apply_list_width(
+            int(self.settings.get("list_width", 455))
+        )
+        self.schedule_layout_save()
+        self.after_idle(self.refresh_after_layout_drag)
+
     def clamp_list_width(self, width: int) -> int:
-        available = max(647, self.content_area.winfo_width())
-        return max(300, min(int(width), available - 347))
+        available = max(587, self.content_area.winfo_width())
+        return max(280, min(int(width), available - 307))
 
     def apply_list_width(self, width: int) -> int:
         desired = self.clamp_list_width(width)
@@ -917,6 +1010,11 @@ class ClipboardLibrary(tk.Tk):
                 self.settings["list_width"] = int(self.list_panel.winfo_width())
             except tk.TclError:
                 pass
+        if hasattr(self, "sidebar_panel"):
+            try:
+                self.settings["sidebar_width"] = int(self.sidebar_panel.winfo_width())
+            except tk.TclError:
+                pass
         save_settings(self.settings)
 
     def apply_window_preset(self, preset: str) -> None:
@@ -929,6 +1027,7 @@ class ClipboardLibrary(tk.Tk):
         width, height = min(width, screen_w), min(height, screen_h)
         x, y = max(0, (screen_w - width) // 2), max(0, (screen_h - height) // 2)
         self.geometry(f"{width}x{height}+{x}+{y}")
+        self.after(160, self.normalize_panel_widths)
         self.schedule_layout_save()
 
     def poll_clipboard(self) -> None:
