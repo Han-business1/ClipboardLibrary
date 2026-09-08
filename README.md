@@ -1,6 +1,8 @@
-# 剪贴板库
+# 剪贴板库 ClipboardLibrary
 
 一个离线的 Windows 文本剪贴板历史工具。关闭后数据仍会保存在本机。
+
+An offline Windows clipboard history manager with editing, version tracking, and a high-DPI card interface.
 
 ## 安装（推荐）
 
