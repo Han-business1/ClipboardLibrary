@@ -34,6 +34,12 @@ DEFAULT_SETTINGS = {
     "close_to_tray": True,
     "poll_interval": 650,
     "language": "zh_CN",
+    "window_width": 1280,
+    "window_height": 820,
+    "window_x": None,
+    "window_y": None,
+    "window_maximized": False,
+    "list_width": 455,
 }
 
 I18N = {
@@ -63,6 +69,9 @@ I18N = {
         "restore_confirm": "恢复到这个版本？当前内容也会留在版本历史中。",
         "image_copy_error": "无法复制截图", "image_unavailable": "截图文件不可用。",
         "startup_error": "无法更新 Windows 启动项", "backup_done": "备份已导出",
+        "window_size": "界面尺寸", "current_size": "保持当前尺寸", "compact_size": "紧凑 · 960×640",
+        "standard_size": "标准 · 1280×820", "large_size": "宽屏 · 1520×900",
+        "layout_hint": "窗口大小、位置和左右分隔比例会自动保存",
     },
     "en_US": {
         "app": "ClipboardLibrary", "tagline": "Save what you copy. Find it when you need it.",
@@ -90,6 +99,9 @@ I18N = {
         "restore_confirm": "Restore this version? The current content will remain in version history.",
         "image_copy_error": "Unable to copy image", "image_unavailable": "Image file unavailable.",
         "startup_error": "Unable to update Windows startup", "backup_done": "Backup exported",
+        "window_size": "Window size", "current_size": "Keep current size", "compact_size": "Compact · 960×640",
+        "standard_size": "Standard · 1280×820", "large_size": "Wide · 1520×900",
+        "layout_hint": "Window size, position, and panel widths are saved automatically",
     },
 }
 
@@ -433,21 +445,35 @@ class ClipboardLibrary(tk.Tk):
         self.tray_icon = None
         self.tray_commands: queue.SimpleQueue[str] = queue.SimpleQueue()
         self.really_quitting = False
+        self.layout_save_after: str | None = None
+        self.layout_ready = False
 
         self.title(self.t("app"))
-        self.geometry("1280x820")
-        self.minsize(980, 660)
+        width = max(900, int(self.settings.get("window_width", 1280)))
+        height = max(600, int(self.settings.get("window_height", 820)))
+        x = self.settings.get("window_x")
+        y = self.settings.get("window_y")
+        geometry = f"{width}x{height}"
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        if (isinstance(x, int) and isinstance(y, int)
+                and -width + 120 < x < screen_w - 120
+                and 0 <= y < screen_h - 80):
+            geometry += f"+{x}+{y}"
+        self.geometry(geometry)
+        self.minsize(900, 600)
         self.configure(bg=self.BG)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self._style()
         self._build()
         self.bind("<Control-s>", lambda _event: self.save_current())
         self.bind("<Control-f>", lambda _event: self.set_view("search"))
+        self.bind("<Configure>", self.on_window_configure)
         self.refresh()
         self.create_tray_icon()
         self.after(100, self.poll_tray_commands)
         self.after(350, self.poll_clipboard)
         self.after(80, self.apply_launch_mode)
+        self.after(250, self.restore_layout)
 
     def t(self, key: str) -> str:
         return I18N.get(self.language, I18N["zh_CN"]).get(key, key)
@@ -534,13 +560,15 @@ class ClipboardLibrary(tk.Tk):
 
         content_area = tk.Frame(workspace, bg=self.PANEL)
         content_area.pack(fill="both", expand=True, padx=22, pady=(0, 18))
-        left = tk.Frame(content_area, bg=self.PANEL, width=455)
-        left.pack(side="left", fill="both", expand=False)
-        left.pack_propagate(False)
-        divider = tk.Frame(content_area, bg=self.BORDER, width=1)
-        divider.pack(side="left", fill="y", padx=16)
-        right = tk.Frame(content_area, bg=self.PANEL)
-        right.pack(side="left", fill="both", expand=True)
+        self.content_split = tk.PanedWindow(content_area, orient="horizontal", bg=self.BORDER,
+                                            sashwidth=7, sashrelief="flat", borderwidth=0,
+                                            showhandle=False, opaqueresize=True)
+        self.content_split.pack(fill="both", expand=True)
+        left = tk.Frame(self.content_split, bg=self.PANEL)
+        right = tk.Frame(self.content_split, bg=self.PANEL)
+        self.content_split.add(left, minsize=300, width=int(self.settings.get("list_width", 455)), stretch="always")
+        self.content_split.add(right, minsize=340, stretch="always")
+        self.content_split.bind("<ButtonRelease-1>", lambda _event: self.schedule_layout_save())
 
         search_wrap = tk.Frame(left, bg=self.PANEL)
         search_wrap.pack(fill="x", pady=(0, 8))
@@ -784,6 +812,68 @@ class ClipboardLibrary(tk.Tk):
         self.bind("<Control-f>", lambda _event: self.set_view("search"))
         self.refresh(select_id=current)
         self.set_capture_enabled(self.capture_enabled, persist=False)
+        self.after(120, self.restore_layout)
+
+    def restore_layout(self) -> None:
+        self.update_idletasks()
+        if hasattr(self, "content_split"):
+            desired = int(self.settings.get("list_width", 455))
+            available = max(650, self.content_split.winfo_width())
+            desired = max(300, min(desired, available - 340))
+            try:
+                self.content_split.sash_place(0, desired, 0)
+            except tk.TclError:
+                pass
+        if self.settings.get("window_maximized") and "--autostart" not in sys.argv:
+            try:
+                self.state("zoomed")
+            except tk.TclError:
+                pass
+        self.layout_ready = True
+
+    def on_window_configure(self, event: tk.Event) -> None:
+        if event.widget is self and self.layout_ready and not self.really_quitting:
+            self.schedule_layout_save()
+
+    def schedule_layout_save(self) -> None:
+        if not self.layout_ready or self.really_quitting:
+            return
+        if self.layout_save_after:
+            try:
+                self.after_cancel(self.layout_save_after)
+            except tk.TclError:
+                pass
+        self.layout_save_after = self.after(500, self.save_window_layout)
+
+    def save_window_layout(self) -> None:
+        self.layout_save_after = None
+        if self.really_quitting:
+            return
+        state = self.state()
+        self.settings["window_maximized"] = state == "zoomed"
+        if state == "normal":
+            self.settings["window_width"] = self.winfo_width()
+            self.settings["window_height"] = self.winfo_height()
+            self.settings["window_x"] = self.winfo_x()
+            self.settings["window_y"] = self.winfo_y()
+        if hasattr(self, "content_split"):
+            try:
+                self.settings["list_width"] = int(self.content_split.sash_coord(0)[0])
+            except tk.TclError:
+                pass
+        save_settings(self.settings)
+
+    def apply_window_preset(self, preset: str) -> None:
+        sizes = {"compact": (960, 640), "standard": (1280, 820), "large": (1520, 900)}
+        if preset not in sizes:
+            return
+        self.state("normal")
+        width, height = sizes[preset]
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        width, height = min(width, screen_w), min(height, screen_h)
+        x, y = max(0, (screen_w - width) // 2), max(0, (screen_h - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.schedule_layout_save()
 
     def poll_clipboard(self) -> None:
         if not self.capture_enabled:
@@ -895,8 +985,8 @@ class ClipboardLibrary(tk.Tk):
     def open_settings(self) -> None:
         dialog = tk.Toplevel(self)
         dialog.title(f"{self.t('settings_title')} · ClipboardLibrary")
-        dialog.geometry("570x610")
-        dialog.minsize(530, 560)
+        dialog.geometry("580x675")
+        dialog.minsize(540, 620)
         dialog.configure(bg=self.BG)
         dialog.transient(self)
         dialog.grab_set()
@@ -916,6 +1006,18 @@ class ClipboardLibrary(tk.Tk):
         language_box = ttk.Combobox(language_row, textvariable=language_var, state="readonly", width=16,
                                     values=(self.t("chinese"), self.t("english")))
         language_box.pack(side="right")
+
+        size_row = tk.Frame(wrap, bg=self.BG)
+        size_row.pack(fill="x", pady=(0, 2))
+        tk.Label(size_row, text=self.t("window_size"), bg=self.BG, fg=self.TEXT,
+                 font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
+        size_var = tk.StringVar(value=self.t("current_size"))
+        size_box = ttk.Combobox(size_row, textvariable=size_var, state="readonly", width=20,
+                                values=(self.t("current_size"), self.t("compact_size"),
+                                        self.t("standard_size"), self.t("large_size")))
+        size_box.pack(side="right")
+        tk.Label(wrap, text=self.t("layout_hint"), bg=self.BG, fg=self.MUTED,
+                 font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(0, 10))
 
         variables = {
             "auto_capture": tk.BooleanVar(value=bool(self.settings["auto_capture"])),
@@ -960,6 +1062,9 @@ class ClipboardLibrary(tk.Tk):
             updated = {key: variable.get() for key, variable in variables.items()}
             updated["poll_interval"] = interval_lookup[interval_var.get()]
             updated["language"] = "en_US" if language_var.get() == self.t("english") else "zh_CN"
+            preset_lookup = {self.t("compact_size"): "compact", self.t("standard_size"): "standard",
+                             self.t("large_size"): "large"}
+            selected_preset = preset_lookup.get(size_var.get())
             try:
                 configure_windows_startup(bool(updated["start_on_boot"]))
             except OSError as error:
@@ -974,6 +1079,8 @@ class ClipboardLibrary(tk.Tk):
             dialog.destroy()
             if language_changed:
                 self.rebuild_interface()
+            if selected_preset:
+                self.after(160, lambda value=selected_preset: self.apply_window_preset(value))
             self.status.configure(text=f"✓ {self.t('saved')}", foreground=self.ACCENT)
             self.after(1800, lambda: self.set_capture_enabled(self.capture_enabled, persist=False))
 
@@ -1257,6 +1364,7 @@ class ClipboardLibrary(tk.Tk):
             messagebox.showinfo(APP_NAME, f"{self.t('backup_done')}:\n{path}")
 
     def on_close(self) -> None:
+        self.save_window_layout()
         if self.settings.get("close_to_tray", True) and self.tray_icon is not None:
             self.withdraw()
             return
@@ -1265,6 +1373,7 @@ class ClipboardLibrary(tk.Tk):
     def quit_app(self) -> None:
         if self.really_quitting:
             return
+        self.save_window_layout()
         self.really_quitting = True
         if self.tray_icon is not None:
             try:
