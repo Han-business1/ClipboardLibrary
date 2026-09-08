@@ -560,19 +560,24 @@ class ClipboardLibrary(tk.Tk):
 
         content_area = tk.Frame(workspace, bg=self.PANEL)
         content_area.pack(fill="both", expand=True, padx=22, pady=(0, 18))
-        self.content_split = tk.PanedWindow(content_area, orient="horizontal", bg=self.BORDER,
-                                            sashwidth=7, sashrelief="flat", borderwidth=0,
-                                            showhandle=False, opaqueresize=False,
-                                            proxybackground=self.ACCENT,
-                                            proxyborderwidth=0,
-                                            proxyrelief="flat",
-                                            cursor="sb_h_double_arrow")
-        self.content_split.pack(fill="both", expand=True)
-        left = tk.Frame(self.content_split, bg=self.PANEL)
-        right = tk.Frame(self.content_split, bg=self.PANEL)
-        self.content_split.add(left, minsize=300, width=int(self.settings.get("list_width", 455)), stretch="always")
-        self.content_split.add(right, minsize=340, stretch="always")
-        self.content_split.bind("<ButtonRelease-1>", self.on_split_release)
+        self.content_area = content_area
+        initial_list_width = 455
+        content_area.grid_rowconfigure(0, weight=1)
+        content_area.grid_columnconfigure(0, minsize=initial_list_width)
+        content_area.grid_columnconfigure(1, minsize=7)
+        content_area.grid_columnconfigure(2, weight=1, minsize=340)
+        left = tk.Frame(content_area, bg=self.PANEL, width=initial_list_width)
+        right = tk.Frame(content_area, bg=self.PANEL)
+        self.list_panel = left
+        left.grid(row=0, column=0, sticky="nsew")
+        right.grid(row=0, column=2, sticky="nsew")
+        left.grid_propagate(False)
+        self.split_handle = tk.Frame(content_area, bg=self.BORDER, width=7,
+                                     cursor="sb_h_double_arrow")
+        self.split_handle.grid(row=0, column=1, sticky="ns")
+        self.split_handle.bind("<ButtonPress-1>", self.on_split_press)
+        self.split_handle.bind("<B1-Motion>", self.on_split_motion)
+        self.split_handle.bind("<ButtonRelease-1>", self.on_split_release)
 
         search_wrap = tk.Frame(left, bg=self.PANEL)
         search_wrap.pack(fill="x", pady=(0, 8))
@@ -820,20 +825,16 @@ class ClipboardLibrary(tk.Tk):
 
     def restore_layout(self) -> None:
         self.update_idletasks()
-        if hasattr(self, "content_split"):
+        if hasattr(self, "content_area"):
             desired = int(self.settings.get("list_width", 455))
-            available = max(650, self.content_split.winfo_width())
-            desired = max(300, min(desired, available - 340))
-            try:
-                self.content_split.sash_place(0, desired, 0)
-            except tk.TclError:
-                pass
+            self.settings["list_width"] = self.apply_list_width(desired)
         if self.settings.get("window_maximized") and "--autostart" not in sys.argv:
             try:
                 self.state("zoomed")
             except tk.TclError:
                 pass
         self.layout_ready = True
+        self.schedule_layout_save()
 
     def on_window_configure(self, event: tk.Event) -> None:
         if event.widget is self and self.layout_ready and not self.really_quitting:
@@ -849,8 +850,43 @@ class ClipboardLibrary(tk.Tk):
                 pass
         self.layout_save_after = self.after(500, self.save_window_layout)
 
-    def on_split_release(self, _event: tk.Event) -> None:
-        """Redraw once after a sash drag instead of repainting the full UI continuously."""
+    def clamp_list_width(self, width: int) -> int:
+        available = max(647, self.content_area.winfo_width())
+        return max(300, min(int(width), available - 347))
+
+    def apply_list_width(self, width: int) -> int:
+        desired = self.clamp_list_width(width)
+        self.list_panel.configure(width=desired)
+        self.content_area.grid_columnconfigure(0, minsize=desired)
+        return desired
+
+    def on_split_press(self, event: tk.Event) -> None:
+        self.split_drag_origin = event.x_root
+        self.split_drag_start = self.list_panel.winfo_width()
+        self.split_drag_target = self.split_drag_start
+        self.split_handle.configure(bg=self.ACCENT)
+        try:
+            self.split_handle.grab_set()
+        except tk.TclError:
+            pass
+
+    def on_split_motion(self, event: tk.Event) -> None:
+        if not hasattr(self, "split_drag_origin"):
+            return
+        self.split_drag_target = self.clamp_list_width(
+            self.split_drag_start + event.x_root - self.split_drag_origin
+        )
+
+    def on_split_release(self, event: tk.Event) -> None:
+        """Apply the new width once, avoiding Tk proxy-line and live-resize artifacts."""
+        self.on_split_motion(event)
+        try:
+            self.split_handle.grab_release()
+        except tk.TclError:
+            pass
+        self.split_handle.configure(bg=self.BORDER)
+        target = getattr(self, "split_drag_target", self.list_panel.winfo_width())
+        self.apply_list_width(target)
         self.schedule_layout_save()
         self.after_idle(self.refresh_after_layout_drag)
 
@@ -861,7 +897,7 @@ class ClipboardLibrary(tk.Tk):
             canvas_width = max(1, self.card_canvas.winfo_width())
             self.card_canvas.itemconfigure(self.card_window, width=canvas_width)
             self.card_canvas.configure(scrollregion=self.card_canvas.bbox("all"))
-            self.content_split.update_idletasks()
+            self.content_area.update_idletasks()
         except tk.TclError:
             pass
 
@@ -876,9 +912,9 @@ class ClipboardLibrary(tk.Tk):
             self.settings["window_height"] = self.winfo_height()
             self.settings["window_x"] = self.winfo_x()
             self.settings["window_y"] = self.winfo_y()
-        if hasattr(self, "content_split"):
+        if hasattr(self, "list_panel"):
             try:
-                self.settings["list_width"] = int(self.content_split.sash_coord(0)[0])
+                self.settings["list_width"] = int(self.list_panel.winfo_width())
             except tk.TclError:
                 pass
         save_settings(self.settings)
