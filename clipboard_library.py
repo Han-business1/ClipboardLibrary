@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import queue
+import shutil
 import sqlite3
 import sys
 import tkinter as tk
 import ctypes
+import uuid
 import winreg
 from datetime import datetime
 from pathlib import Path
@@ -14,10 +17,10 @@ from tkinter import filedialog, messagebox, ttk
 
 try:
     import pystray
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageGrab, ImageTk
 except ImportError:  # Source mode can still run without the optional tray package.
     pystray = None
-    Image = ImageDraw = None
+    Image = ImageDraw = ImageGrab = ImageTk = None
 
 
 APP_NAME = "剪贴板库"
@@ -70,6 +73,49 @@ def configure_windows_startup(enabled: bool) -> None:
                 pass
 
 
+def copy_image_to_windows_clipboard(image_path: Path) -> None:
+    """Place a PNG file on the Windows clipboard as CF_DIB."""
+    if Image is None:
+        raise RuntimeError("Pillow 图像组件不可用")
+    with Image.open(image_path) as source:
+        image = source.convert("RGB")
+        buffer = io.BytesIO()
+        image.save(buffer, "BMP")
+        dib = buffer.getvalue()[14:]
+
+    kernel32 = ctypes.windll.kernel32
+    user32 = ctypes.windll.user32
+    kernel32.GlobalAlloc.argtypes = (ctypes.c_uint, ctypes.c_size_t)
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = (ctypes.c_void_p,)
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
+    kernel32.GlobalFree.argtypes = (ctypes.c_void_p,)
+    user32.SetClipboardData.argtypes = (ctypes.c_uint, ctypes.c_void_p)
+    user32.SetClipboardData.restype = ctypes.c_void_p
+
+    handle = kernel32.GlobalAlloc(0x0002, len(dib))
+    if not handle:
+        raise OSError("无法分配剪贴板图像内存")
+    pointer = kernel32.GlobalLock(handle)
+    if not pointer:
+        kernel32.GlobalFree(handle)
+        raise OSError("无法锁定剪贴板图像内存")
+    ctypes.memmove(pointer, dib, len(dib))
+    kernel32.GlobalUnlock(handle)
+    if not user32.OpenClipboard(None):
+        kernel32.GlobalFree(handle)
+        raise OSError("系统剪贴板正被其他程序占用")
+    try:
+        user32.EmptyClipboard()
+        if not user32.SetClipboardData(8, handle):  # CF_DIB
+            kernel32.GlobalFree(handle)
+            raise OSError("无法写入图像剪贴板")
+        handle = None  # Windows owns the allocation after SetClipboardData succeeds.
+    finally:
+        user32.CloseClipboard()
+
+
 def enable_high_dpi() -> None:
     """Ask Windows for per-monitor DPI rendering before Tk creates a window."""
     try:
@@ -95,6 +141,8 @@ def display_time(value: str) -> str:
 class Store:
     def __init__(self, path: Path = DB_PATH) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.data_dir = path.parent
+        self.images_dir = self.data_dir / "images"
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys = ON")
@@ -103,6 +151,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS clips (
                 id INTEGER PRIMARY KEY,
                 content TEXT NOT NULL,
+                clip_type TEXT NOT NULL DEFAULT 'text',
+                image_path TEXT NOT NULL DEFAULT '',
                 note TEXT NOT NULL DEFAULT '',
                 tags TEXT NOT NULL DEFAULT '',
                 pinned INTEGER NOT NULL DEFAULT 0,
@@ -130,6 +180,11 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_events_clip ON events(clip_id, id DESC);
             """
         )
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(clips)").fetchall()}
+        if "clip_type" not in columns:
+            self.db.execute("ALTER TABLE clips ADD COLUMN clip_type TEXT NOT NULL DEFAULT 'text'")
+        if "image_path" not in columns:
+            self.db.execute("ALTER TABLE clips ADD COLUMN image_path TEXT NOT NULL DEFAULT ''")
         self.db.commit()
 
     def capture(self, content: str) -> int | None:
@@ -147,6 +202,29 @@ class Store:
             (clip_id, content, "捕获原文", stamp),
         )
         self.log(clip_id, "已捕获", "来自系统剪贴板", stamp, commit=False)
+        self.db.commit()
+        return clip_id
+
+    def capture_image(self, image: "Image.Image") -> int:
+        self.images_dir.mkdir(parents=True, exist_ok=True)
+        stamp = now()
+        filename = f"screenshot-{datetime.now():%Y%m%d-%H%M%S-%f}-{uuid.uuid4().hex[:6]}.png"
+        image_path = self.images_dir / filename
+        normalized = image.convert("RGBA") if image.mode not in ("RGB", "RGBA") else image.copy()
+        normalized.save(image_path, format="PNG", optimize=True)
+        width, height = normalized.size
+        content = f"截图 {width}×{height}"
+        cur = self.db.execute(
+            """INSERT INTO clips(content, clip_type, image_path, created_at, updated_at)
+               VALUES (?, 'image', ?, ?, ?)""",
+            (content, str(image_path), stamp, stamp),
+        )
+        clip_id = int(cur.lastrowid)
+        self.db.execute(
+            "INSERT INTO versions(clip_id, content, reason, created_at) VALUES (?, ?, ?, ?)",
+            (clip_id, content, "捕获截图", stamp),
+        )
+        self.log(clip_id, "已捕获截图", f"{width}×{height} PNG", stamp, commit=False)
         self.db.commit()
         return clip_id
 
@@ -202,6 +280,15 @@ class Store:
         return value
 
     def delete(self, clip_id: int) -> None:
+        row = self.get(clip_id)
+        if row and row["clip_type"] == "image" and row["image_path"]:
+            try:
+                image_path = Path(row["image_path"]).resolve()
+                images_root = self.images_dir.resolve()
+                if image_path.is_relative_to(images_root):
+                    image_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         self.db.execute("DELETE FROM clips WHERE id=?", (clip_id,))
         self.db.commit()
 
@@ -271,6 +358,8 @@ class ClipboardLibrary(tk.Tk):
         self.store = Store()
         self.current_id: int | None = None
         self.card_widgets: dict[int, tk.Frame] = {}
+        self.thumbnail_refs: dict[int, "ImageTk.PhotoImage"] = {}
+        self.preview_image_ref = None
         self.suppress_clipboard: str | None = None
         self.last_seen: str | None = None
         self.last_sequence = 0
@@ -390,12 +479,20 @@ class ClipboardLibrary(tk.Tk):
         toolbar = ttk.Frame(right, style="Panel.TFrame")
         toolbar.pack(fill="x", padx=16, pady=(14, 8))
         ttk.Button(toolbar, text="复制", style="Accent.TButton", command=self.copy_current).pack(side="left")
+        self.save_image_button = ttk.Button(toolbar, text="另存截图", command=self.save_image_copy, state="disabled")
+        self.save_image_button.pack(side="left", padx=7)
         ttk.Button(toolbar, text="置顶 / 取消", command=self.pin_current).pack(side="left", padx=7)
         ttk.Button(toolbar, text="删除", style="Danger.TButton", command=self.delete_current).pack(side="right")
 
         fields = ttk.Frame(right, style="Panel.TFrame")
         fields.pack(fill="both", expand=True, padx=16)
-        ttk.Label(fields, text="内容", background=self.PANEL).pack(anchor="w")
+        self.content_label = ttk.Label(fields, text="内容", background=self.PANEL)
+        self.content_label.pack(anchor="w")
+        self.image_panel = tk.Frame(fields, bg=self.CARD, highlightbackground=self.BORDER,
+                                    highlightthickness=1)
+        self.image_preview = tk.Label(self.image_panel, bg=self.CARD, fg=self.MUTED,
+                                      text="截图文件不可用", font=("Microsoft YaHei UI", 10))
+        self.image_preview.pack(fill="both", expand=True, padx=12, pady=12)
         self.content = tk.Text(fields, height=10, wrap="word", undo=True, bg=self.CARD,
                                fg=self.TEXT, insertbackground=self.TEXT, relief="flat",
                                padx=12, pady=10, font=("Microsoft YaHei UI", 11),
@@ -403,6 +500,7 @@ class ClipboardLibrary(tk.Tk):
         self.content.pack(fill="both", expand=True, pady=(6, 10))
 
         meta = ttk.Frame(fields, style="Panel.TFrame")
+        self.meta_frame = meta
         meta.pack(fill="x")
         ttk.Label(meta, text="标签", background=self.PANEL).grid(row=0, column=0, sticky="w")
         ttk.Label(meta, text="备注", background=self.PANEL).grid(row=0, column=1, sticky="w", padx=(12, 0))
@@ -448,15 +546,26 @@ class ClipboardLibrary(tk.Tk):
             sequence = ctypes.windll.user32.GetClipboardSequenceNumber()
             if sequence != self.last_sequence:
                 self.last_sequence = sequence
-                value = self.clipboard_get()
-                self.last_seen = value
-                if value == self.suppress_clipboard:
-                    self.suppress_clipboard = None
-                else:
-                    clip_id = self.store.capture(value)
-                    if clip_id:
+                try:
+                    value = self.clipboard_get()
+                except tk.TclError:
+                    value = None
+                if isinstance(value, str):
+                    self.last_seen = value
+                    if value == self.suppress_clipboard:
+                        self.suppress_clipboard = None
+                    else:
+                        clip_id = self.store.capture(value)
+                        if clip_id:
+                            self.refresh(select_id=clip_id)
+                elif ImageGrab is not None:
+                    grabbed = ImageGrab.grabclipboard()
+                    if Image is not None and isinstance(grabbed, Image.Image):
+                        clip_id = self.store.capture_image(grabbed)
                         self.refresh(select_id=clip_id)
-        except tk.TclError:
+                        self.status.configure(text="✓ 截图已保存", foreground=self.ACCENT)
+                        self.after(1800, lambda: self.set_capture_enabled(self.capture_enabled, persist=False))
+        except (tk.TclError, OSError):
             pass
         self.after(self.poll_interval, self.poll_clipboard)
 
@@ -624,6 +733,7 @@ class ClipboardLibrary(tk.Tk):
         for child in self.card_host.winfo_children():
             child.destroy()
         self.card_widgets.clear()
+        self.thumbnail_refs.clear()
 
         if not rows:
             empty = tk.Label(self.card_host, text="暂无匹配记录\n复制一段文字后会自动出现在这里",
@@ -653,19 +763,35 @@ class ClipboardLibrary(tk.Tk):
 
         top = tk.Frame(card, bg=bg)
         top.pack(fill="x", padx=14, pady=(9, 3))
-        marker = "★ 置顶" if row["pinned"] else f"记录 #{clip_id}"
+        kind = "截图" if row["clip_type"] == "image" else "文本"
+        marker = "★ 置顶" if row["pinned"] else f"{kind} · #{clip_id}"
         tk.Label(top, text=marker, bg=bg, fg=self.ACCENT if row["pinned"] else self.MUTED,
                  font=("Microsoft YaHei UI", 9, "bold" if row["pinned"] else "normal")).pack(side="left")
         exact_time = display_time(row["created_at"])
         tk.Label(top, text=exact_time, bg=bg, fg=self.MUTED,
                  font=("Segoe UI", 9)).pack(side="right")
 
-        clean = " ".join(row["content"].split()) or "（空白内容）"
-        preview = clean[:150] + ("…" if len(clean) > 150 else "")
-        text_label = tk.Label(card, text=preview, bg=bg, fg=self.TEXT, anchor="w",
-                              justify="left", wraplength=390,
-                              font=("Microsoft YaHei UI", 11), padx=14, pady=5)
-        text_label.pack(fill="x")
+        if row["clip_type"] == "image" and row["image_path"] and Image is not None and ImageTk is not None:
+            try:
+                with Image.open(row["image_path"]) as source:
+                    thumb = source.convert("RGB")
+                    thumb.thumbnail((390, 150), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(thumb)
+                self.thumbnail_refs[clip_id] = photo
+                image_label = tk.Label(card, image=photo, bg=bg, padx=14, pady=5, anchor="w")
+                image_label.pack(fill="x")
+                tk.Label(card, text=row["content"], bg=bg, fg=self.TEXT, anchor="w",
+                         font=("Microsoft YaHei UI", 10), padx=14, pady=2).pack(fill="x")
+            except OSError:
+                tk.Label(card, text="截图文件不可用", bg=bg, fg=self.DANGER, anchor="w",
+                         font=("Microsoft YaHei UI", 10), padx=14, pady=12).pack(fill="x")
+        else:
+            clean = " ".join(row["content"].split()) or "（空白内容）"
+            preview = clean[:150] + ("…" if len(clean) > 150 else "")
+            text_label = tk.Label(card, text=preview, bg=bg, fg=self.TEXT, anchor="w",
+                                  justify="left", wraplength=390,
+                                  font=("Microsoft YaHei UI", 11), padx=14, pady=5)
+            text_label.pack(fill="x")
 
         bottom = tk.Frame(card, bg=bg)
         bottom.pack(fill="x", padx=14, pady=(3, 9))
@@ -706,6 +832,27 @@ class ClipboardLibrary(tk.Tk):
             return
         self.content.delete("1.0", "end")
         self.content.insert("1.0", row["content"])
+        if row["clip_type"] == "image":
+            self.content_label.configure(text="截图预览")
+            self.content.pack_forget()
+            self.image_panel.pack(fill="both", expand=True, pady=(6, 10), before=self.meta_frame)
+            self.save_image_button.configure(state="normal")
+            self.preview_image_ref = None
+            try:
+                if Image is None or ImageTk is None:
+                    raise OSError("图像组件不可用")
+                with Image.open(row["image_path"]) as source:
+                    preview = source.convert("RGB")
+                    preview.thumbnail((680, 360), Image.Resampling.LANCZOS)
+                self.preview_image_ref = ImageTk.PhotoImage(preview)
+                self.image_preview.configure(image=self.preview_image_ref, text="")
+            except OSError:
+                self.image_preview.configure(image="", text="截图文件不可用")
+        else:
+            self.content_label.configure(text="内容")
+            self.image_panel.pack_forget()
+            self.content.pack(fill="both", expand=True, pady=(6, 10), before=self.meta_frame)
+            self.save_image_button.configure(state="disabled")
         self.tags.delete(0, "end")
         self.tags.insert(0, row["tags"])
         self.note.delete(0, "end")
@@ -749,6 +896,21 @@ class ClipboardLibrary(tk.Tk):
     def copy_current(self) -> None:
         if self.current_id is None:
             return
+        row = self.store.get(self.current_id)
+        if not row:
+            return
+        if row["clip_type"] == "image":
+            try:
+                copy_image_to_windows_clipboard(Path(row["image_path"]))
+                self.last_sequence = ctypes.windll.user32.GetClipboardSequenceNumber()
+            except (OSError, RuntimeError) as error:
+                messagebox.showerror(APP_NAME, f"无法复制截图：\n{error}")
+                return
+            self.store.log(self.current_id, "已复制截图", "从剪贴板库复制到系统剪贴板")
+            self.load_trace()
+            self.status.configure(text="✓ 截图已复制")
+            self.after(1500, lambda: self.set_capture_enabled(self.capture_enabled, persist=False))
+            return
         value = self.content.get("1.0", "end-1c")
         self.clipboard_clear()
         self.clipboard_append(value)
@@ -759,6 +921,24 @@ class ClipboardLibrary(tk.Tk):
         self.load_trace()
         self.status.configure(text="✓ 已复制")
         self.after(1500, lambda: self.status.configure(text="● 正在监听"))
+
+    def save_image_copy(self) -> None:
+        if self.current_id is None:
+            return
+        row = self.store.get(self.current_id)
+        if not row or row["clip_type"] != "image" or not row["image_path"]:
+            return
+        source = Path(row["image_path"])
+        if not source.exists():
+            messagebox.showerror(APP_NAME, "截图文件不可用。")
+            return
+        filename = f"ClipboardLibrary-{datetime.now():%Y%m%d-%H%M%S}.png"
+        target = filedialog.asksaveasfilename(defaultextension=".png", initialfile=filename,
+                                              filetypes=[("PNG 图片", "*.png")])
+        if target:
+            shutil.copy2(source, target)
+            self.store.log(self.current_id, "已另存截图", Path(target).name)
+            self.load_trace()
 
     def pin_current(self) -> None:
         if self.current_id is not None:
