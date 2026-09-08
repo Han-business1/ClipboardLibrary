@@ -50,6 +50,8 @@ I18N = {
         "items": "条记录", "local_only": "你的内容仅保存在本机", "listening": "正在监听",
         "paused": "已暂停", "pause": "暂停监听", "resume": "继续监听", "export": "导出备份",
         "all_types": "全部类型", "newest": "最新在前", "oldest": "最早在前",
+        "date": "日期", "today": "今天", "all_dates": "全部日期",
+        "date_items": "{date} · {count} 条记录",
         "timeline": "每次复制、剪切和截图都会自动记录", "empty": "暂无匹配记录\n复制文字或截图后会自动出现在这里",
         "text": "文本", "image": "截图", "record": "记录", "pin_mark": "已置顶",
         "no_tag": "未添加标签", "has_note": "有备注", "click_edit": "点击查看与编辑 →",
@@ -80,6 +82,8 @@ I18N = {
         "items": "items", "local_only": "Your content stays on this device", "listening": "Listening",
         "paused": "Paused", "pause": "Pause", "resume": "Resume", "export": "Export backup",
         "all_types": "All types", "newest": "Newest first", "oldest": "Oldest first",
+        "date": "Date", "today": "Today", "all_dates": "All dates",
+        "date_items": "{date} · {count} items",
         "timeline": "Every copy, cut, and screenshot is saved automatically", "empty": "No matching items\nCopy text or take a screenshot to get started",
         "text": "Text", "image": "Image", "record": "Item", "pin_mark": "Pinned",
         "no_tag": "No tags", "has_note": "Has note", "click_edit": "View and edit →",
@@ -247,6 +251,7 @@ class Store:
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_clips_updated ON clips(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_clips_created_day ON clips(substr(created_at, 1, 10), created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_versions_clip ON versions(clip_id, id DESC);
             CREATE INDEX IF NOT EXISTS idx_events_clip ON events(clip_id, id DESC);
             """
@@ -300,7 +305,7 @@ class Store:
         return clip_id
 
     def list_clips(self, query: str = "", oldest_first: bool = False,
-                   pinned_only: bool = False) -> list[sqlite3.Row]:
+                   pinned_only: bool = False, date_filter: str | None = None) -> list[sqlite3.Row]:
         direction = "ASC" if oldest_first else "DESC"
         conditions = []
         params: list[str | int] = []
@@ -310,10 +315,22 @@ class Store:
             params.extend((like, like, like))
         if pinned_only:
             conditions.append("pinned = 1")
+        if date_filter:
+            conditions.append("substr(created_at, 1, 10) = ?")
+            params.append(date_filter)
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
         return self.db.execute(
             f"SELECT * FROM clips{where} ORDER BY created_at {direction}, id {direction}", params
         ).fetchall()
+
+    def available_dates(self) -> list[str]:
+        rows = self.db.execute(
+            """SELECT DISTINCT substr(created_at, 1, 10) AS clip_date
+               FROM clips
+               WHERE length(created_at) >= 10
+               ORDER BY clip_date DESC"""
+        ).fetchall()
+        return [str(row["clip_date"]) for row in rows if row["clip_date"]]
 
     def stats(self) -> tuple[int, int]:
         today = datetime.now().astimezone().date().isoformat()
@@ -432,6 +449,9 @@ class ClipboardLibrary(tk.Tk):
         self.settings = load_settings()
         self.language = str(self.settings.get("language", "zh_CN"))
         self.view_mode = "history"
+        self.active_day = datetime.now().astimezone().date().isoformat()
+        self.selected_date = self.active_day
+        self.date_display_map: dict[str, str] = {}
         self.store = Store()
         self.current_id: int | None = None
         self.card_widgets: dict[int, tk.Frame] = {}
@@ -476,6 +496,7 @@ class ClipboardLibrary(tk.Tk):
         self.after(350, self.poll_clipboard)
         self.after(80, self.apply_launch_mode)
         self.after(250, self.restore_layout)
+        self.after(30000, self.check_day_rollover)
 
     def t(self, key: str) -> str:
         return I18N.get(self.language, I18N["zh_CN"]).get(key, key)
@@ -604,14 +625,23 @@ class ClipboardLibrary(tk.Tk):
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self.on_search)
         self.search_entry = ttk.Entry(search_wrap, textvariable=self.search_var)
-        self.search_entry.pack(side="left", fill="x", expand=True)
+        self.search_entry.pack(fill="x", expand=True)
+
+        filter_wrap = tk.Frame(left, bg=self.PANEL)
+        filter_wrap.pack(fill="x", pady=(0, 8))
+        self.date_var = tk.StringVar(value=self.format_date_option(self.selected_date))
+        self.date_box = ttk.Combobox(filter_wrap, textvariable=self.date_var,
+                                     state="readonly", width=17)
+        self.date_box.pack(side="left", fill="x", expand=True)
+        self.date_box.bind("<<ComboboxSelected>>", self.on_date_selected)
         self.sort_var = tk.StringVar(value=self.t("newest"))
-        sort_box = ttk.Combobox(search_wrap, textvariable=self.sort_var,
-                                values=(self.t("newest"), self.t("oldest")), width=12, state="readonly")
+        sort_box = ttk.Combobox(filter_wrap, textvariable=self.sort_var,
+                                values=(self.t("newest"), self.t("oldest")), width=11, state="readonly")
         sort_box.pack(side="left", padx=(8, 0))
         sort_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh())
-        tk.Label(left, text=self.t("timeline"), bg=self.PANEL, fg=self.MUTED,
-                 font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(0, 6))
+        self.timeline_label = tk.Label(left, text=self.t("timeline"), bg=self.PANEL, fg=self.MUTED,
+                                       font=("Microsoft YaHei UI", 9))
+        self.timeline_label.pack(anchor="w", pady=(0, 6))
 
         timeline = tk.Frame(left, bg=self.PANEL)
         timeline.pack(fill="both", expand=True)
@@ -818,6 +848,49 @@ class ClipboardLibrary(tk.Tk):
             self.search_entry.focus_set()
         self.update_nav_state()
         self.refresh()
+
+    def format_date_option(self, value: str) -> str:
+        if value == self.active_day:
+            return f"{self.t('today')} · {value}"
+        return value
+
+    def update_date_selector(self) -> None:
+        if not hasattr(self, "date_box"):
+            return
+        dates = self.store.available_dates()
+        if self.active_day not in dates:
+            dates.insert(0, self.active_day)
+        displays = [self.format_date_option(value) for value in dates]
+        self.date_display_map = dict(zip(displays, dates))
+        self.date_box.configure(values=displays)
+        if self.view_mode == "history":
+            if self.selected_date not in dates:
+                self.selected_date = self.active_day
+            self.date_var.set(self.format_date_option(self.selected_date))
+            self.date_box.configure(state="readonly")
+        else:
+            self.date_var.set(self.t("all_dates"))
+            self.date_box.configure(state="disabled")
+
+    def on_date_selected(self, _event: tk.Event) -> None:
+        selected = self.date_display_map.get(self.date_var.get())
+        if not selected or selected == self.selected_date:
+            return
+        self.selected_date = selected
+        self.current_id = None
+        self.refresh()
+
+    def check_day_rollover(self) -> None:
+        if self.really_quitting:
+            return
+        today = datetime.now().astimezone().date().isoformat()
+        if today != self.active_day:
+            self.active_day = today
+            self.selected_date = today
+            self.current_id = None
+            if self.view_mode == "history":
+                self.refresh()
+        self.after(30000, self.check_day_rollover)
 
     def update_nav_state(self) -> None:
         if not hasattr(self, "nav_buttons"):
@@ -1247,15 +1320,28 @@ class ClipboardLibrary(tk.Tk):
         self.search_after = self.after(180, self.refresh)
 
     def refresh(self, select_id: int | None = None) -> None:
+        self.update_date_selector()
         query = self.search_var.get().strip() if hasattr(self, "search_var") else ""
         oldest_first = hasattr(self, "sort_var") and self.sort_var.get() == self.t("oldest")
-        rows = self.store.list_clips(query, oldest_first, pinned_only=self.view_mode == "pinned")
+        date_filter = self.selected_date if self.view_mode == "history" else None
+        rows = self.store.list_clips(query, oldest_first,
+                                     pinned_only=self.view_mode == "pinned",
+                                     date_filter=date_filter)
         total, today_count = self.store.stats()
         if hasattr(self, "total_label"):
             self.total_label.configure(text=f"全部 {total} 条")
             self.today_label.configure(text=f"今天 {today_count} 条")
         if hasattr(self, "side_count_label"):
             self.side_count_label.configure(text=f"{total} {self.t('items')}")
+        if hasattr(self, "timeline_label"):
+            if self.view_mode == "history":
+                self.timeline_label.configure(
+                    text=self.t("date_items").format(
+                        date=self.format_date_option(self.selected_date), count=len(rows)
+                    )
+                )
+            else:
+                self.timeline_label.configure(text=self.t("timeline"))
         current = select_id or self.current_id
         for child in self.card_host.winfo_children():
             child.destroy()
@@ -1263,6 +1349,7 @@ class ClipboardLibrary(tk.Tk):
         self.thumbnail_refs.clear()
 
         if not rows:
+            self.clear_detail()
             empty = tk.Label(self.card_host, text=self.t("empty"),
                              bg=self.PANEL, fg=self.MUTED, font=("Microsoft YaHei UI", 11),
                              justify="center", pady=48)
@@ -1278,6 +1365,20 @@ class ClipboardLibrary(tk.Tk):
         self.card_canvas.configure(scrollregion=self.card_canvas.bbox("all"))
         if current is not None:
             self.select_card(int(current), scroll_to=select_id is not None)
+
+    def clear_detail(self) -> None:
+        self.current_id = None
+        self.content.delete("1.0", "end")
+        self.image_panel.pack_forget()
+        if not self.content.winfo_manager():
+            self.content.pack(fill="both", expand=True, pady=(6, 10), before=self.meta_frame)
+        self.content_label.configure(text=self.t("content"))
+        self.tags.delete(0, "end")
+        self.note.delete(0, "end")
+        self.detail_label.configure(text=self.t("choose"))
+        self.save_image_button.configure(state="disabled")
+        self.version_tree.delete(*self.version_tree.get_children())
+        self.event_tree.delete(*self.event_tree.get_children())
 
     def create_clip_card(self, row: sqlite3.Row, selected: bool = False) -> None:
         clip_id = int(row["id"])

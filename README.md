@@ -6,7 +6,7 @@ An offline Windows clipboard history manager with editing, version tracking, and
 
 ## 安装（推荐）
 
-双击 `release/剪贴板库-安装程序-v1.6.0.exe`，按安装向导操作。安装后可在软件设置中开启登录 Windows 后自动启动，并可从 Windows 的“已安装的应用”正常卸载。
+双击 `release/剪贴板库-安装程序-v1.7.0.exe`，按安装向导操作。安装后可在软件设置中开启登录 Windows 后自动启动，并可从 Windows 的“已安装的应用”正常卸载。
 
 安装后的软件是独立 EXE，不要求电脑预先安装 Python。
 
@@ -29,6 +29,8 @@ An offline Windows clipboard history manager with editing, version tracking, and
 - 设置页提供紧凑、标准和宽屏三种界面尺寸预设
 - 启用 Windows Per-Monitor V2 高 DPI 渲染，改善高分屏和缩放显示效果
 - 按捕获时间展示时间线，可切换“最新在前”或“最早在前”
+- 历史记录按本地日期自动归类，默认显示今天，并可从日期下拉框查看任意有记录日期
+- 跨过午夜后自动切换到新的一天；旧日期记录会保留，不会被清空或覆盖
 - 全文搜索内容、标签与备注
 - 选择任意时间线记录后直接编辑内容、标签和备注，并自动生成版本历史
 - 查看捕获、编辑、恢复、复制和置顶等操作轨迹

@@ -1,5 +1,5 @@
 #define MyAppName "剪贴板库"
-#define MyAppVersion "1.6.0"
+#define MyAppVersion "1.7.0"
 #define MyAppPublisher "Clipboard Library"
 #define MyAppExeName "ClipboardLibrary.exe"
 
@@ -27,7 +27,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式："; Flags: unchecked
 
 [Files]
-Source: "dist-v160\ClipboardLibrary.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist-v170\ClipboardLibrary.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
