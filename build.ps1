@@ -4,8 +4,8 @@ Set-Location $PSScriptRoot
 python .\tools\generate_icon.py
 python -m PyInstaller --noconfirm --clean --onefile --windowed `
   --name ClipboardLibrary `
-  --workpath .\build-v150 `
-  --distpath .\dist-v150 `
+  --workpath .\build-v151 `
+  --distpath .\dist-v151 `
   --icon .\clipboard_library.ico `
   --version-file .\version_info.txt `
   .\clipboard_library.py
@@ -21,4 +21,4 @@ if (-not $iscc) { throw "未找到 Inno Setup 6 (ISCC.exe)。" }
 & $iscc .\installer.iss
 if ($LASTEXITCODE -ne 0) { throw "安装程序编译失败，退出码：$LASTEXITCODE" }
 
-Write-Host "`n构建完成：$PSScriptRoot\release\剪贴板库-安装程序-v1.5.0.exe"
+Write-Host "`n构建完成：$PSScriptRoot\release\剪贴板库-安装程序-v1.5.1.exe"

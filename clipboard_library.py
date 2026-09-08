@@ -562,13 +562,17 @@ class ClipboardLibrary(tk.Tk):
         content_area.pack(fill="both", expand=True, padx=22, pady=(0, 18))
         self.content_split = tk.PanedWindow(content_area, orient="horizontal", bg=self.BORDER,
                                             sashwidth=7, sashrelief="flat", borderwidth=0,
-                                            showhandle=False, opaqueresize=True)
+                                            showhandle=False, opaqueresize=False,
+                                            proxybackground=self.ACCENT,
+                                            proxyborderwidth=0,
+                                            proxyrelief="flat",
+                                            cursor="sb_h_double_arrow")
         self.content_split.pack(fill="both", expand=True)
         left = tk.Frame(self.content_split, bg=self.PANEL)
         right = tk.Frame(self.content_split, bg=self.PANEL)
         self.content_split.add(left, minsize=300, width=int(self.settings.get("list_width", 455)), stretch="always")
         self.content_split.add(right, minsize=340, stretch="always")
-        self.content_split.bind("<ButtonRelease-1>", lambda _event: self.schedule_layout_save())
+        self.content_split.bind("<ButtonRelease-1>", self.on_split_release)
 
         search_wrap = tk.Frame(left, bg=self.PANEL)
         search_wrap.pack(fill="x", pady=(0, 8))
@@ -844,6 +848,22 @@ class ClipboardLibrary(tk.Tk):
             except tk.TclError:
                 pass
         self.layout_save_after = self.after(500, self.save_window_layout)
+
+    def on_split_release(self, _event: tk.Event) -> None:
+        """Redraw once after a sash drag instead of repainting the full UI continuously."""
+        self.schedule_layout_save()
+        self.after_idle(self.refresh_after_layout_drag)
+
+    def refresh_after_layout_drag(self) -> None:
+        if not self.winfo_exists():
+            return
+        try:
+            canvas_width = max(1, self.card_canvas.winfo_width())
+            self.card_canvas.itemconfigure(self.card_window, width=canvas_width)
+            self.card_canvas.configure(scrollregion=self.card_canvas.bbox("all"))
+            self.content_split.update_idletasks()
+        except tk.TclError:
+            pass
 
     def save_window_layout(self) -> None:
         self.layout_save_after = None
