@@ -1,5 +1,5 @@
 #define MyAppName "剪贴板库"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Clipboard Library"
 #define MyAppExeName "ClipboardLibrary.exe"
 
@@ -25,15 +25,13 @@ ArchitecturesInstallIn64BitMode=x64compatible
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式："; Flags: unchecked
-Name: "startup"; Description: "登录 Windows 后自动启动"; GroupDescription: "自动启动："; Flags: unchecked
 
 [Files]
-Source: "dist-v110\ClipboardLibrary.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist-v120\ClipboardLibrary.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
-Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: startup
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent

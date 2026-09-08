@@ -2,17 +2,72 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import sqlite3
+import sys
 import tkinter as tk
 import ctypes
+import winreg
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+except ImportError:  # Source mode can still run without the optional tray package.
+    pystray = None
+    Image = ImageDraw = None
 
 
 APP_NAME = "剪贴板库"
 DATA_DIR = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "ClipboardLibrary"
 DB_PATH = DATA_DIR / "clipboard.db"
+SETTINGS_PATH = DATA_DIR / "settings.json"
+DEFAULT_SETTINGS = {
+    "auto_capture": True,
+    "start_on_boot": False,
+    "start_minimized": True,
+    "close_to_tray": True,
+    "poll_interval": 650,
+}
+
+
+def load_settings() -> dict:
+    settings = DEFAULT_SETTINGS.copy()
+    try:
+        saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        if isinstance(saved, dict):
+            settings.update({key: saved[key] for key in settings if key in saved})
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return settings
+
+
+def save_settings(settings: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SETTINGS_PATH.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def configure_windows_startup(enabled: bool) -> None:
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            if getattr(sys, "frozen", False):
+                command = f'"{sys.executable}" --autostart'
+            else:
+                command = f'"{sys.executable}" "{Path(__file__).resolve()}" --autostart'
+            winreg.SetValueEx(key, "ClipboardLibrary", 0, winreg.REG_SZ, command)
+        else:
+            try:
+                winreg.DeleteValue(key, "ClipboardLibrary")
+            except FileNotFoundError:
+                pass
+            legacy_shortcut = Path(os.getenv("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs/Startup/剪贴板库.lnk"
+            try:
+                legacy_shortcut.unlink()
+            except (FileNotFoundError, OSError):
+                pass
 
 
 def enable_high_dpi() -> None:
@@ -212,14 +267,19 @@ class ClipboardLibrary(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
+        self.settings = load_settings()
         self.store = Store()
         self.current_id: int | None = None
         self.card_widgets: dict[int, tk.Frame] = {}
         self.suppress_clipboard: str | None = None
         self.last_seen: str | None = None
         self.last_sequence = 0
-        self.capture_enabled = True
+        self.capture_enabled = bool(self.settings["auto_capture"])
+        self.poll_interval = int(self.settings["poll_interval"])
         self.search_after: str | None = None
+        self.tray_icon = None
+        self.tray_commands: queue.SimpleQueue[str] = queue.SimpleQueue()
+        self.really_quitting = False
 
         self.title(APP_NAME)
         self.geometry("1280x820")
@@ -231,7 +291,10 @@ class ClipboardLibrary(tk.Tk):
         self.bind("<Control-s>", lambda _event: self.save_current())
         self.bind("<Control-f>", lambda _event: self.search_entry.focus_set())
         self.refresh()
+        self.create_tray_icon()
+        self.after(100, self.poll_tray_commands)
         self.after(350, self.poll_clipboard)
+        self.after(80, self.apply_launch_mode)
 
     def _style(self) -> None:
         style = ttk.Style(self)
@@ -268,6 +331,7 @@ class ClipboardLibrary(tk.Tk):
         self.status = ttk.Label(header, text="● 正在监听", foreground=self.ACCENT)
         self.status.pack(side="left", padx=16)
         ttk.Button(header, text="导出备份", command=self.export).pack(side="right")
+        ttk.Button(header, text="设置", command=self.open_settings).pack(side="right", padx=(8, 0))
         self.pause_button = ttk.Button(header, text="暂停监听", command=self.toggle_capture)
         self.pause_button.pack(side="right", padx=8)
 
@@ -378,7 +442,7 @@ class ClipboardLibrary(tk.Tk):
 
     def poll_clipboard(self) -> None:
         if not self.capture_enabled:
-            self.after(650, self.poll_clipboard)
+            self.after(self.poll_interval, self.poll_clipboard)
             return
         try:
             sequence = ctypes.windll.user32.GetClipboardSequenceNumber()
@@ -394,17 +458,154 @@ class ClipboardLibrary(tk.Tk):
                         self.refresh(select_id=clip_id)
         except tk.TclError:
             pass
-        self.after(650, self.poll_clipboard)
+        self.after(self.poll_interval, self.poll_clipboard)
 
     def toggle_capture(self) -> None:
-        self.capture_enabled = not self.capture_enabled
-        if self.capture_enabled:
+        self.set_capture_enabled(not self.capture_enabled)
+
+    def set_capture_enabled(self, enabled: bool, persist: bool = True) -> None:
+        self.capture_enabled = enabled
+        if enabled:
             self.last_sequence = ctypes.windll.user32.GetClipboardSequenceNumber()
             self.pause_button.configure(text="暂停监听")
             self.status.configure(text="● 正在监听", foreground=self.ACCENT)
         else:
             self.pause_button.configure(text="继续监听")
             self.status.configure(text="Ⅱ 已暂停", foreground=self.MUTED)
+        if persist:
+            self.settings["auto_capture"] = enabled
+            save_settings(self.settings)
+        if self.tray_icon:
+            try:
+                self.tray_icon.update_menu()
+            except Exception:
+                pass
+
+    def apply_launch_mode(self) -> None:
+        self.set_capture_enabled(bool(self.settings["auto_capture"]), persist=False)
+        if "--autostart" in sys.argv and self.settings["start_minimized"]:
+            self.withdraw()
+
+    def create_tray_icon(self) -> None:
+        if pystray is None or Image is None or ImageDraw is None:
+            return
+        icon_image = Image.new("RGBA", (64, 64), (18, 24, 33, 255))
+        draw = ImageDraw.Draw(icon_image)
+        draw.rounded_rectangle((13, 12, 51, 55), radius=8, fill=(98, 214, 194, 255))
+        draw.rounded_rectangle((24, 7, 40, 19), radius=4, fill=(245, 247, 250, 255))
+        for y in (27, 37, 47):
+            draw.rounded_rectangle((21, y, 43, y + 4), radius=2, fill=(24, 61, 58, 255))
+
+        def enqueue(command: str):
+            return lambda _icon=None, _item=None: self.tray_commands.put(command)
+
+        self.tray_icon = pystray.Icon(
+            "ClipboardLibrary",
+            icon_image,
+            "剪贴板库 ClipboardLibrary",
+            menu=pystray.Menu(
+                pystray.MenuItem("打开剪贴板库", enqueue("show"), default=True),
+                pystray.MenuItem(
+                    lambda _item: "继续自动记录" if not self.capture_enabled else "暂停自动记录",
+                    enqueue("toggle"),
+                ),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("退出", enqueue("quit")),
+            ),
+        )
+        self.tray_icon.run_detached()
+
+    def poll_tray_commands(self) -> None:
+        try:
+            while True:
+                command = self.tray_commands.get_nowait()
+                if command == "show":
+                    self.deiconify()
+                    self.state("normal")
+                    self.lift()
+                    self.focus_force()
+                elif command == "toggle":
+                    self.toggle_capture()
+                elif command == "quit":
+                    self.quit_app()
+                    return
+        except queue.Empty:
+            pass
+        if not self.really_quitting:
+            self.after(100, self.poll_tray_commands)
+
+    def open_settings(self) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title("设置 · ClipboardLibrary")
+        dialog.geometry("560x520")
+        dialog.minsize(520, 470)
+        dialog.configure(bg=self.BG)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        wrap = tk.Frame(dialog, bg=self.BG)
+        wrap.pack(fill="both", expand=True, padx=26, pady=22)
+        tk.Label(wrap, text="设置", bg=self.BG, fg=self.TEXT,
+                 font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w")
+        tk.Label(wrap, text="后台运行与自动记录", bg=self.BG, fg=self.MUTED,
+                 font=("Microsoft YaHei UI", 10)).pack(anchor="w", pady=(2, 16))
+
+        variables = {
+            "auto_capture": tk.BooleanVar(value=bool(self.settings["auto_capture"])),
+            "start_on_boot": tk.BooleanVar(value=bool(self.settings["start_on_boot"])),
+            "start_minimized": tk.BooleanVar(value=bool(self.settings["start_minimized"])),
+            "close_to_tray": tk.BooleanVar(value=bool(self.settings["close_to_tray"])),
+        }
+
+        options = (
+            ("auto_capture", "自动记录剪贴板", "检测到复制或剪切时自动保存文本内容"),
+            ("start_on_boot", "登录 Windows 后自动启动", "为当前 Windows 用户添加启动项"),
+            ("start_minimized", "开机启动时在后台运行", "不弹出主窗口，仅显示在系统托盘"),
+            ("close_to_tray", "关闭窗口后继续运行", "点击关闭按钮时隐藏到系统托盘并继续监听"),
+        )
+        for key, title, description in options:
+            card = tk.Frame(wrap, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1)
+            card.pack(fill="x", pady=5)
+            check = tk.Checkbutton(card, text=title, variable=variables[key], bg=self.CARD,
+                                   fg=self.TEXT, activebackground=self.CARD, activeforeground=self.TEXT,
+                                   selectcolor=self.PANEL, font=("Microsoft YaHei UI", 10, "bold"),
+                                   anchor="w", padx=12, pady=7)
+            check.pack(fill="x")
+            tk.Label(card, text=description, bg=self.CARD, fg=self.MUTED,
+                     font=("Microsoft YaHei UI", 9), anchor="w", padx=38).pack(fill="x", pady=(0, 9))
+
+        speed = tk.Frame(wrap, bg=self.BG)
+        speed.pack(fill="x", pady=(12, 6))
+        tk.Label(speed, text="监听频率", bg=self.BG, fg=self.TEXT,
+                 font=("Microsoft YaHei UI", 10)).pack(side="left")
+        interval_var = tk.StringVar(value={350: "快速 · 350 毫秒", 650: "标准 · 650 毫秒",
+                                           1000: "节能 · 1000 毫秒"}.get(self.poll_interval, "标准 · 650 毫秒"))
+        interval_box = ttk.Combobox(speed, textvariable=interval_var, state="readonly", width=18,
+                                    values=("快速 · 350 毫秒", "标准 · 650 毫秒", "节能 · 1000 毫秒"))
+        interval_box.pack(side="right")
+
+        buttons = tk.Frame(wrap, bg=self.BG)
+        buttons.pack(fill="x", pady=(18, 0))
+        ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side="right")
+
+        def apply() -> None:
+            interval_lookup = {"快速 · 350 毫秒": 350, "标准 · 650 毫秒": 650, "节能 · 1000 毫秒": 1000}
+            updated = {key: variable.get() for key, variable in variables.items()}
+            updated["poll_interval"] = interval_lookup[interval_var.get()]
+            try:
+                configure_windows_startup(bool(updated["start_on_boot"]))
+            except OSError as error:
+                messagebox.showerror(APP_NAME, f"无法更新 Windows 启动项：\n{error}", parent=dialog)
+                return
+            self.settings.update(updated)
+            self.poll_interval = int(updated["poll_interval"])
+            self.set_capture_enabled(bool(updated["auto_capture"]), persist=False)
+            save_settings(self.settings)
+            dialog.destroy()
+            self.status.configure(text="✓ 设置已保存", foreground=self.ACCENT)
+            self.after(1800, lambda: self.set_capture_enabled(self.capture_enabled, persist=False))
+
+        ttk.Button(buttons, text="保存设置", style="Accent.TButton", command=apply).pack(side="right", padx=8)
 
     def on_search(self, *_: object) -> None:
         if self.search_after:
@@ -597,6 +798,20 @@ class ClipboardLibrary(tk.Tk):
             messagebox.showinfo(APP_NAME, f"备份已导出：\n{path}")
 
     def on_close(self) -> None:
+        if self.settings.get("close_to_tray", True) and self.tray_icon is not None:
+            self.withdraw()
+            return
+        self.quit_app()
+
+    def quit_app(self) -> None:
+        if self.really_quitting:
+            return
+        self.really_quitting = True
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
         self.store.db.close()
         self.destroy()
 
